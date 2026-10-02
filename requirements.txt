@@ -1,0 +1,4 @@
+numpy>=1.24
+scipy>=1.10
+mrcfile>=1.4
+fabio>=2024.4

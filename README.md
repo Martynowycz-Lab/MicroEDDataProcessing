@@ -1,200 +1,177 @@
-MicroEDDataProcessing. An MRC to miniCBF conversion pipeline.
+# MicroEDDataProcessing
 
-Convert ED movie stacks (.mrc) into Pilatus-style CBF images with optional beam-center finding, smoothing, image shifting, and metadata extraction from SerialEM .mdoc files. 
-Parallelized where it matters. Some bugs. Some things do not work as intended. A work in progress. Built on top of methods from earlier ED papers and 4dstem papers. 
+`mrc2cbf.py` (v9) converts MRC diffraction movies to miniCBF on Linux and macOS.
+It uses `metadata.py` to read one SerialEM movie and optional Velox XML timing.
+The published `mrc2cbf_pipeline_v3.py` is unchanged. Its original instructions
+and the local v7/v8 code are preserved in [legacy](legacy/README.md).
 
-Script: mrc2cbf_pipeline_v3.py
-Input: 3D MRC stack (frames × rows × cols)
-Output: per-frame .cbf files + logs/diagnostics
+The converter sum-bins pixels, trims weak ends, estimates a static beam centre,
+and adds a reversible storage pedestal. It does not subtract a radial background,
+filter diffraction intensities, estimate gain, or tune offsets to improve
+integration statistics. Every written CBF is decoded and checked against the
+intended integer pixels before the conversion is marked complete.
 
-Why this exists
-	•	Turn raw MRC stacks into CBF files many crystallography tools expect (XDS/DIALS/MOSFLM)
-	•	Find beam center per frame (2D Gaussian fit with robust fallbacks). Same approach as 4dstem experiments- nothing new here.
-  **THIS DOES NOT WORK WITH A BEAMSTOM**	
-  •	Smooth/remove outlier centers (jump detection + Savitzky–Golay). Fails sometimes on big jumps. 
-	•	Optionally shift images so the beam sits at the geometric center.
-	•	Auto-fill metadata from .mdoc (pixel size, camera length, tilt, rotation rate, etc.). This requires properly set u MDOC files and calibrated SerialEM for ED.
-	•	Fast: multiprocessing for beam finding and writing. 
+## Install
 
-When ran properly, this makes MRC stacks with a hundred to a few hundred images into miniCBF files (uses FabIO) in under a minute. 
+Python 3.10 or newer:
 
-**Installation**
+```bash
+git clone https://github.com/Martynowycz-Lab/MicroEDDataProcessing.git
+cd MicroEDDataProcessing
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
 
-# Python ≥3.8 recommended (some odd stuff with numpy and int/int64 depending on versions)
-pip install numpy scipy matplotlib mrcfile fabio
+Keep `mrc2cbf.py` and `metadata.py` together. DIALS and XDS are separate programs;
+neither is needed for conversion. No custom DIALS format plugin is required.
 
-If you use conda: conda install -c conda-forge numpy scipy matplotlib mrcfile fabio
+## Convert
 
-**Quick start**
+Matching `movie.mrc.mdoc` and `movie.xml` sidecars are found automatically:
 
-Easiest (with .mdoc)
+```bash
+python mrc2cbf.py movie.mrc cbf \
+  --pixel-size-mm 0.028 0.028 --rotation-axis 0.999263 -0.0383878 0
+```
 
-python mrc2cbf_pipeline_v3.py path/to/stack.mrc out_dir --mdoc path/to/stack.mdoc
+These are example numbers for our calibrated 2048-pixel Falcon acquisition,
+not universal defaults. Pixel sizes describe **stored MRC pixels**, including
+acquisition binning. The axis must be calibrated for the stored array orientation
+in the DIALS frame: fast +x, slow -y, beam travelling -z. Image flips, camera pitch
+and rotation axis are never guessed. `CameraPixelSize`, `PixelSpacing` and
+`RotationRate` are not silently interpreted as detector pitch or stage speed.
 
-Explicit parameters (no .mdoc)
+MDOC supplies distance, voltage, start angle and `DegreesPerSecond` when available.
+`TiltAngle` is interpreted as the start of input frame 1, not its centre; confirm
+this convention in your acquisition software. XML counts, dimensions, exposure
+durations, timestamps and detector-frame continuity are checked. Inconsistent
+sidecars and nonuniform scans stop conversion. Only a single MDOC FrameSet movie
+is supported; multi-image tilt-series autodocs must not be flattened into it.
+Explicit sidecar paths can be selected with `--mdoc` and `--xml`.
+Exposure agreement uses the larger of 100 microseconds and 0.1% of a frame;
+timestamp jitter about a fitted constant period is bounded by the larger of
+10 microseconds and 0.5% of a frame. Both measured residuals and the timestamp
+tolerance are recorded; this is a tested constant-wedge approximation, not a
+measurement of stage motion during every exposure.
+CBF exposure duration and frame period are recorded separately when XML provides them.
 
-python mrc2cbf_pipeline_v3.py path/to/stack.mrc out_dir \
-  --pixel-size-mm 0.015  \
-  --detector-distance-mm 1200 \
-  --wavelength-A 0.0251 \
-  --start-angle-deg -30.0 \
-  --angle-increment-deg 0.02
+Without sidecars, supply the complete geometry:
 
-Recommended for 4k images (more tolerant beam finding)
+```bash
+python mrc2cbf.py movie.mrc cbf \
+  --pixel-size-mm 0.028 0.028 --rotation-axis 0.999263 -0.0383878 0 \
+  --distance-mm 961.06 --voltage-kv 200 \
+  --start-angle-deg -60 --angle-step-deg 0.169 --frame-time-s 0.08444
+```
 
-python mrc2cbf_pipeline_v3.py stack.mrc out_dir --mdoc stack.mdoc \
-  --roi-size 120 --max-dev 60
+`--wavelength-a` can replace `--voltage-kv`. The output directory must be new.
+Raw inputs are opened read-only. Failures return a nonzero exit code and leave
+partial output for inspection, without a `conversion.json` completion record.
+Choose a fresh directory to retry. Existing files are never overwritten.
 
-What the pipeline does (in order)
-	1.	Load MRC stack (frames, y, x).
-	2.	Bin data (optional): --bin-z/--bin-y/--bin-x (sum-binning; trailing slices dropped if not divisible).
-	3.	Pedestal (optional/auto): offsets negatives to ≥0 (recorded in CBF header).
-	4.	Beam center: first pass
-	•	ROI around image center → Gaussian blur → peak seed
-	•	Bound-constrained 2D Gaussian fit; fallback to blurred peak if fit fails
-	5.	Second pass (optional): detect large frame-to-frame jumps, fix with chosen strategy, then Savitzky–Golay smooth if enough valid points.
-	6.	Image shift (optional): translate each frame so the beam lands at the geometric center; update header accordingly.
-	7.	Write CBF via fabio with Pilatus-style header (pixel size, distance, wavelength, beam, angle series, pedestal, cutoff).
-	8.	Diagnostics: plots, per-frame timings, and a text file of final centers.
+## Pixels And Offset
 
-**Inputs & metadata**
+Additional integer sum-binning targets at most 1024 pixels per axis by default.
+Smaller images are not enlarged. `--bin 1` preserves size; `--bin 2` sums 2 by 2
+blocks. Both dimensions must divide exactly. No detector rows/columns or partial
+time bins are silently dropped; temporal binning is not implemented.
 
-From .mdoc (if provided)
-	•	Binning (Binning): default for --bin-x/--bin-y.**This is the wrong behavior. Working on it.**
-	•	CameraPixelSize (µm/pix): unbinned --pixel-size-mm.
-	•	CameraLength (mm): --detector-distance-mm.
-	•	Voltage (kV): --wavelength-A (relativistic).
-	•	TiltAngle (FrameSet 0): → --start-angle-deg.
-	•	DegreesPerSecond × ExposureTime / NumSubFrames (or RotationRate): --angle-increment-deg (per original frame; adjusted by --bin-z automatically).
+Integer sums are exact. Floating-point input is summed in float64, then rounded
+once to the nearest integer (ties to even); the maximum rounding error is reported.
+`--saturation ADU` marks input values at or above a calibrated limit invalid.
+Otherwise the integer datatype ceiling is used; float input has no inferred
+saturation limit. `--bad-pixels mask.npy` takes a boolean, input-sized mask where
+True means invalid. A bin containing any invalid input is invalid. Invalid pixels
+are stored as -1, not filled or included in the pedestal estimate.
 
-Can override any of these using CLI flags.
+For valid binned values Y, `CBF = round(Y) + pedestal`. The automatic pedestal is
+`max(0, -min(round(Y)))` over retained valid pixels. `--pedestal N` supplies another
+value, but it must preserve every valid pixel. There is no quantile clipping or
+automatic classification of negative tails as detector defects.
 
-Key behaviors & conventions
-	•	Coordinates: Internally 0-based (y, x).
-CBF header uses 1-based (x, y) as # Beam_xy.
-	•	When shifting is enabled: images are shifted so the beam is at the geometric center; the header records that center.
-When disabled: images are not shifted; header keeps the found beam.
-	•	Pixel size in header: assumes square pixels; scaled by --bin-x. Keep --bin-x == --bin-y for correct header geometry.
-	•	--bin-z reduces frame count; angle increment is multiplied by --bin-z.
+**The exact value added is written as XDS OFFSET and DIALS panel pedestal.**
+Both XDS input files use the same number. XDS GAIN remains unset so INIT can
+estimate it. MDOC/XML gain is never applied to either processing program.
 
-**CLI reference**
+For genuine unscaled integer counts, add `--counting`. This validates nonnegative
+integer input and forces both pedestal and OFFSET to zero. Counting acquisition
+alone does not establish the gain of arbitrarily scaled saved images.
 
-Run python mrc2cbf_pipeline_v3.py -h for defaults.
+## Trimming And Centre
 
-Required (either via flags or .mdoc):
-	•	mrc_path — input .mrc
-	•	output_dir — folder to write results
-	•	Geometry/time series: --pixel-size-mm, --detector-distance-mm, --wavelength-A, --start-angle-deg, --angle-increment-deg
-	•	Or: --mdoc path/to/file.mdoc
+`--trim aggressive` removes only weak leading/trailing illumination. Each retained
+edge requires five consecutive strong frames, using direct-beam peak and summed
+signal relative to their 75th percentiles. These are illumination heuristics, not
+diffraction-quality measurements. Internal weak frames stay in place to preserve
+angles. Use `--trim none` and `--frames FIRST LAST` (inclusive, 1-based) when needed.
 
-**General:**
-	•	--mdoc path/to/file.mdoc
-	•	--bin-x, --bin-y, --bin-z (default 1)
-	•	--pedestal INT (else auto if negatives are present)
-	•	--no-auto-pedestal
-	•	--skip-beam-centering
-	•	--no-image-shift
-	•	--shift-order {0..5} (scipy spline order; 1 is linear)
-	•	--overload INT (CBF Count_cutoff, default 1,000,000)
-	•	-n/--num-workers INT
-	•	--limit-frames N
-	•	--filename-template "image_{:05d}.cbf"
-**Beam finding:**
-	•	--roi-size INT (size of ROI box around image center)
-	•	--blur-sigma FLOAT (Gaussian pre-blur)
-	•	--max-dev FLOAT (max initial peak deviation from ROI center, px)
-	•	--no-fit-bounds (disable bounds in fit)
+Automatic beam finding fits a broad elliptical halo twice with a robust loss,
+excluding the central core. The median of up to 21 fits across the retained sweep
+defines one static centre. At least 80% must succeed; 95th-percentile drift above
+two output pixels stops conversion. This cannot guarantee a correct centre for
+obscured beams or nearby strong reflections. Inspect the report and refine
+geometry downstream. `--beam-radius` adjusts the central search window.
 
-**Smoothing / second pass:**
-	•	--no-smoothing
-	•	--max-jump FLOAT (px; mark outliers above this)
-	•	--smooth-window INT (odd; auto-adjusts if even)
-	•	--smooth-order INT (Savitzky–Golay poly order)
-	•	--smooth-fallback {previous|interpolate|global_median}
+`--beam-center X Y` supplies a calibrated centre in **zero-based input pixel
+centre coordinates**, without an automatic drift check. By default pixel positions
+are unchanged. `--center` applies one integer translation to the whole sweep and
+marks uncovered borders invalid. It can crop edge reflections and does not correct
+a moving beam. There is no subpixel interpolation or per-frame image warping.
 
-**Diagnostics / logging:**
-	•	--plot-first-pass
-	•	--no-final-plot
-	•	--plot-frames "0,10,42" (per-frame diagnostic PNGs)
-	•	--no-save-centers
-	•	--log-level {DEBUG|INFO|WARNING|ERROR}
-	•	--log-file-level {DEBUG|INFO|WARNING|ERROR}
+## XDS And DIALS
 
-**Typical recipes**
-1) Use .mdoc, keep everything default
+Outputs include `XDS.INP`, `XDS_20230630.INP`, `import_dials.py`, `frames.csv`,
+`conversion.json`, and `image_000001.cbf` onwards. Helpers contain absolute CBF
+paths. Copy the input file/importer to a writable processing directory while
+leaving the CBF files in the read-only data directory:
 
-python mrc2cbf_pipeline_v3.py movie.mrc out --mdoc movie.mdoc
+```bash
+python3 import_dials.py
+python3 import_dials.py --gain 12.5 --output measured_gain.expt
+python3 import_dials.py --source /another/mount/cbf --output other_mount.expt
+```
 
-2) Faster & smaller with spatial binning
+Additional DIALS `name=value` parameters can follow `--`. `--dry-run` prints the
+command. `--pedestal` overrides the DIALS subtraction explicitly; normally keep
+the generated value. Without a gain option, DIALS uses its own default, which
+is **not** a detector-gain measurement.
 
-python mrc2cbf_pipeline_v3.py movie.mrc out --mdoc movie.mdoc --bin-x 2 --bin-y 2
+An explicit scalar approximation from XDS INIT is available:
 
-3) Time-bin frames (boost SNR, fewer CBFs)
+```bash
+python3 import_dials.py --gain-from-init /path/to/xds/INIT.LP --output xds_gain.expt
+```
 
-python mrc2cbf_pipeline_v3.py movie.mrc out --mdoc movie.mdoc --bin-z 5
+The helper requires the same CBF path and pedestal in INIT.LP and uses its mean
+gain. This does not reproduce XDS's spatial gain map or variance model. DIALS
+divides corrected pixels by panel gain; do not apply it a second time elsewhere.
+A direct GAIN.cbf transfer is not included: its sampling changed between XDS
+versions, and a guessed resampling is not a validated map conversion.
 
-4) Robust beam finding for large 4k frames
+Run `xds_par` in the writable directory. For XDS 20230630, use `XDS_20230630.INP`
+as `XDS.INP`. Edit the absolute image template if the mount changes. Electron
+templates disable X-ray polarization, air-absorption and silicon-thickness
+corrections. No resolution cutoff or lattice is selected automatically.
 
-python mrc2cbf_pipeline_v3.py movie.mrc out --mdoc movie.mdoc --roi-size 120 --max-dev 60
+Preserving signed signal does not make it Poisson-distributed or guarantee correct
+treatment by every XDS release. Zero high-shell I/sigma with meaningful CC1/2,
+sentinel negative Rmeas, or unsupported high-resolution signal still require
+investigation. The converter does not tune OFFSET to hide these symptoms.
 
-5) Don’t shift images; keep native beam position
+## Validation
 
-python mrc2cbf_pipeline_v3.py movie.mrc out --mdoc movie.mdoc --no-image-shift
+```bash
+python -m unittest discover -s tests -v
+python tests/check_pixels.py /path/to/cbf/conversion.json
+dials.python tests/check_dials.py imported.expt /path/to/cbf/conversion.json /path/to/cbf/XDS.INP
+```
 
+The latter commands independently check raw pixels and stock-DIALS geometry. See
+[VALIDATION.md](VALIDATION.md) for measured results and evidence limits.
+`conversion.json` records a completed file conversion, not a validated structure.
+It includes code hashes, source size/mtime, geometry, trim and pedestal. `frames.csv`
+maps every output to its input frame/start angle and records each CBF's SHA-256.
 
-Outputs
-	•	image_00001.cbf, image_00002.cbf, … (rename using --filename-template)
-	•	beam_centers_final.txt
-Columns: FrameIndex(0-based)  Beam_Y(px,0-based)  Beam_X(px,0-based)  Status
-	•	beam_centers_first_pass.png (if --plot-first-pass)
-	•	beam_centers_final.png (unless --no-final-plot)
-	•	diagnostic_frame_00042.png (if --plot-frames)
-	•	Log file: mrc2cbf_mp_init_parBeam_YYYYMMDD_HHMMSS.log in output_dir
-
-
-**Performance tips**	
-•	Use -n <CPU cores> for large stacks. Defaults to cpu_count().
-	•	Spatial binning (--bin-x/--bin-y) reduces compute and file size.
-	•	--bin-z reduces the number of output frames and increases angular step (done automatically).
-	•	--shift-order 1 (linear) is usually a good speed/quality trade-off.
-
-**Troubleshooting**
-	•	“Missing required parameters”: supply missing geometry/angle flags or pass --mdoc.
-	•	No valid beam centers: increase --roi-size, relax --max-dev, try --blur-sigma 2–4.
-	•	Jumpy centers: lower --max-jump, enable smoothing (default), or set --smooth-fallback interpolate.
-	•	Weird pixel size in header: keep --bin-x == --bin-y (header assumes square pixels, scales by --bin-x).
-	•	Negative intensities / bad CBF: keep auto-pedestal on (default) or set --pedestal manually.
-	•	Write failures: check output_dir permissions and free space.
-
-**Notes on units & headers**
-•	Pixel size (CBF): meters; computed as pixel_size_mm / 1000 × bin_x.
-	•	Detector distance: meters.
-	•	Wavelength: Å.
-	•	Angles: degrees; start angle + (frame_index × angle_increment_after_binZ).
-	•	Beam_xy: 1-based pixel indices in the header.
-
-**Reproducibility**
-	•	Turn on verbose logging:
-
-python mrc2cbf_pipeline_v3.py movie.mrc out --mdoc movie.mdoc --log-level DEBUG
-	•	The log captures parameters, progress, and timing summaries.
-
-
-
-**Development**
-	•	macOS: the script prefers the fork start method for multiprocessing; warnings are printed if it can’t switch.
-	•	Cross-platform: Linux/macOS tested; Windows uses default spawn.
-
-**Contributing**
-
-Contribution is welcome (bug reports, feature requests, docs).
-
-**License**
-
-CC-BY-4.0
-
-**Citation**
-
-If this pipeline helps your work, consider citing the repo in Methods/Software. This was first described in:
-https://www.biorxiv.org/content/10.1101/2025.07.03.663097v1 
-
+License: CC-BY-4.0, as declared by the original repository. The historical method
+was described in [the original paper](https://www.biorxiv.org/content/10.1101/2025.07.03.663097v1).
