@@ -1,6 +1,6 @@
 # MicroEDDataProcessing
 
-`mrc2cbf.py` (v9) converts MRC diffraction movies to miniCBF on Linux and macOS.
+`mrc2cbf.py` (v9.0.1) converts MRC diffraction movies to miniCBF on Linux and macOS.
 It uses `metadata.py` to read one SerialEM movie and optional Velox XML timing.
 The published `mrc2cbf_pipeline_v3.py` is unchanged. Its original instructions
 and the local v7/v8 code are preserved in [legacy](legacy/README.md).
@@ -31,16 +31,34 @@ neither is needed for conversion. No custom DIALS format plugin is required.
 Matching `movie.mrc.mdoc` and `movie.xml` sidecars are found automatically:
 
 ```bash
-python mrc2cbf.py movie.mrc cbf \
-  --pixel-size-mm 0.028 0.028 --rotation-axis 0.999263 -0.0383878 0
+python mrc2cbf.py movie.mrc cbf
 ```
 
-These are example numbers for our calibrated 2048-pixel Falcon acquisition,
-not universal defaults. Pixel sizes describe **stored MRC pixels**, including
-acquisition binning. The axis must be calibrated for the stored array orientation
-in the DIALS frame: fast +x, slow -y, beam travelling -z. Image flips, camera pitch
-and rotation axis are never guessed. `CameraPixelSize`, `PixelSpacing` and
-`RotationRate` are not silently interpreted as detector pitch or stage speed.
+Pixel size is resolved from MDOC `CameraPixelSize` in micrometres or the recognized
+Falcon/Ceta detector and acquisition binning, as in v7. A stored-pixel value such
+as 28 micrometres at binning 2 is used once, not multiplied by binning again.
+A value matching the known 14-micrometre native pitch is multiplied by the stated
+acquisition binning once, with a message. When the pitch is absent, the known
+detector uses MDOC/XML binning, then XML ROI/MRC dimensions. A last-resort 4096-pixel
+full-sensor assumption produces a cropping warning. Unknown detectors can use an
+explicit `CameraPixelSize`, with a warning about the assumed stored-pixel units.
+If no usable pitch can be found, the error asks for `--pixel-size-mm X Y`.
+
+When no rotation axis is supplied, the converter uses the **v7 lab default**
+`0.999263 -0.0383878 0` and prints that **it may be wrong for your setup**. This is
+a fallback, not an axis measured from MDOC/XML or the diffraction patterns. Its
+source is recorded in `conversion.json`. Explicit overrides always take precedence:
+
+```bash
+python mrc2cbf.py movie.mrc cbf \
+  --pixel-size-mm 0.028 0.028 --rotation-axis 1 0 0
+```
+
+Pixel overrides describe **stored MRC pixels**, including acquisition binning.
+The axis uses the DIALS frame: fast +x, slow -y, beam travelling -z. Other
+microscopes should use their calibrated axis. `PixelSpacing` and `RotationRate`
+are still not interpreted as detector pitch or calibrated stage speed. Metadata
+sources and fallback warnings are printed before frame processing.
 
 MDOC supplies distance, voltage, start angle and `DegreesPerSecond` when available.
 `TiltAngle` is interpreted as the start of input frame 1, not its centre; confirm

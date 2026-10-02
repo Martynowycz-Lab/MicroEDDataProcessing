@@ -15,7 +15,13 @@ from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import mrc2cbf as converter
-from metadata import electron_wavelength, geometry, read_mdoc
+from metadata import (
+    LAB_ROTATION_AXIS,
+    detector_geometry,
+    electron_wavelength,
+    geometry,
+    read_mdoc,
+)
 
 
 class PixelTests(unittest.TestCase):
@@ -144,6 +150,91 @@ def arguments(source, output, extra=()):
 
 
 class MetadataTests(unittest.TestCase):
+    def resolve_detector(self, mdoc, xml=None, shape=(7, 2048, 2048), overrides=False):
+        import xml.etree.ElementTree as ET
+
+        args = arguments("a", "b")
+        if not overrides:
+            args.pixel_size_mm = None
+            args.rotation_axis = None
+        sources, notes = {}, []
+        pixel, axis = detector_geometry(
+            args, mdoc, ET.fromstring(xml) if xml else None, shape, sources, notes
+        )
+        return pixel, axis, sources, notes
+
+    def test_geometry_flags_are_optional_at_cli(self):
+        args = converter.parser().parse_args(["movie.mrc", "cbf"])
+        self.assertIsNone(args.pixel_size_mm)
+        self.assertIsNone(args.rotation_axis)
+
+    def test_mdoc_stored_pitch_and_v7_axis_defaults(self):
+        pixel, axis, sources, notes = self.resolve_detector(
+            {
+                "CameraPixelSize": "28",
+                "Binning": "2",
+                "SubFramePath": "BM-Falcon/movie.mrc",
+            }
+        )
+        np.testing.assert_allclose(pixel, [0.028, 0.028])
+        np.testing.assert_allclose(axis, LAB_ROTATION_AXIS)
+        self.assertIn("CameraPixelSize", sources["pixel_size_mm"])
+        self.assertTrue(any("not specified" in note for note in notes))
+        self.assertTrue(any("may be wrong" in note for note in notes))
+
+    def test_native_pitch_is_binned_once(self):
+        pixel, _, sources, notes = self.resolve_detector(
+            {"CameraPixelSize": "14", "Binning": "2", "CameraName": "Ceta"}
+        )
+        np.testing.assert_allclose(pixel, [0.028, 0.028])
+        self.assertIn("native pitch", sources["pixel_size_mm"])
+        self.assertTrue(any("applied once" in note for note in notes))
+
+    def test_detector_profile_with_xml_binning(self):
+        pixel, _, sources, _ = self.resolve_detector(
+            {},
+            "<Info><CommercialName>Falcon 4</CommercialName><Binning>4</Binning></Info>",
+        )
+        np.testing.assert_allclose(pixel, [0.056, 0.056])
+        self.assertIn("XML Binning", sources["pixel_size_mm"])
+
+    def test_roi_prevents_mistaking_crop_for_binning(self):
+        pixel, _, sources, notes = self.resolve_detector(
+            {},
+            "<Info><CommercialName>Falcon 4</CommercialName><RegionOfInterest>"
+            "<Width>2048</Width><Height>2048</Height></RegionOfInterest></Info>",
+        )
+        np.testing.assert_allclose(pixel, [0.014, 0.014])
+        self.assertIn("ROI", sources["pixel_size_mm"])
+        self.assertFalse(any("full 4096" in note for note in notes))
+
+    def test_dimension_fallback_warns_about_cropping(self):
+        pixel, _, _, notes = self.resolve_detector({"CameraName": "Ceta"})
+        np.testing.assert_allclose(pixel, [0.028, 0.028])
+        self.assertTrue(any("full 4096" in note for note in notes))
+
+    def test_unknown_detector_can_use_documented_pixel_pitch(self):
+        pixel, _, _, notes = self.resolve_detector({"CameraPixelSize": "55 56"})
+        np.testing.assert_allclose(pixel, [0.055, 0.056])
+        self.assertTrue(any("could not confirm" in note for note in notes))
+
+    def test_unknown_pixel_pitch_is_not_guessed_from_pixelspacing(self):
+        with self.assertRaisesRegex(ValueError, "Cannot determine stored pixel size"):
+            self.resolve_detector({"PixelSpacing": "0.00116061"})
+
+    def test_conflicting_binning_needs_explicit_override(self):
+        mdoc = {"CameraName": "Falcon 4", "Binning": "2"}
+        xml = "<Info><Binning>4</Binning></Info>"
+        with self.assertRaisesRegex(ValueError, "binning disagrees"):
+            self.resolve_detector(mdoc, xml)
+        pixel, axis, sources, notes = self.resolve_detector(mdoc, xml, overrides=True)
+        np.testing.assert_allclose(pixel, [0.028, 0.031])
+        np.testing.assert_allclose(axis, [0.98, -0.05, 0.03])
+        self.assertEqual(
+            sources, {"pixel_size_mm": "command line", "rotation_axis": "command line"}
+        )
+        self.assertEqual(notes, [])
+
     def test_wavelength(self):
         self.assertAlmostEqual(electron_wavelength(200), 0.02507934, places=7)
         self.assertAlmostEqual(electron_wavelength(300), 0.01968749, places=7)
@@ -290,6 +381,55 @@ class EndToEndTests(unittest.TestCase):
         args = arguments(self.source, self.root / name, extra)
         with contextlib.redirect_stdout(io.StringIO()):
             return converter.convert(args)
+
+    def test_sidecar_only_cli_conversion_matches_explicit_geometry(self):
+        source = self.root / "auto.mrc"
+        yy, xx = np.indices((64, 64))
+        halo = 20 + 5000 * np.exp(-((xx - 32.1) ** 2 + (yy - 30.8) ** 2) / 120)
+        with mrcfile.new(source) as movie:
+            movie.set_data(np.stack([np.rint(halo)] * 7).astype(np.int16))
+            movie.set_image_stack()
+        mdoc = Path(str(source) + ".mdoc")
+        mdoc.write_text(
+            "Voltage = 200\nDegreesPerSecond = 2\n[FrameSet = 0]\n"
+            "CameraLength = 961.06\nTiltAngle = -60\nExposureTime = 0.7\n"
+            "NumSubFrames = 7\nCameraPixelSize = 28\nBinning = 2\n"
+            "SubFramePath = BM-Falcon/auto.mrc\nCountsPerElectron = 999\n"
+        )
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        mdoc_hash = hashlib.sha256(mdoc.read_bytes()).hexdigest()
+        command = [
+            sys.executable,
+            str(Path(converter.__file__)),
+            str(source),
+            str(self.root / "auto"),
+        ]
+        result = subprocess.run(command, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("v7 lab default", result.stdout)
+        result = subprocess.run(
+            command[:-1]
+            + [
+                str(self.root / "explicit"),
+                "--pixel-size-mm",
+                "0.028",
+                "0.028",
+                "--rotation-axis",
+                "0.999263",
+                "-0.0383878",
+                "0",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        for idx in range(1, 8):
+            self.assertEqual(
+                (self.root / "auto" / f"image_{idx:06d}.cbf").read_bytes(),
+                (self.root / "explicit" / f"image_{idx:06d}.cbf").read_bytes(),
+            )
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), source_hash)
+        self.assertEqual(hashlib.sha256(mdoc.read_bytes()).hexdigest(), mdoc_hash)
 
     def test_signed_roundtrip_and_geometry(self):
         report = self.run_conversion(extra=["--frames", "2", "6", "--bin", "2"])

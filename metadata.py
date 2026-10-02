@@ -8,6 +8,10 @@ import numpy as np
 from scipy.constants import c, e, h, m_e
 
 
+LAB_ROTATION_AXIS = (0.999263, -0.0383878, 0.0)
+FALCON_CETA_PIXEL_MM = 0.014
+
+
 def electron_wavelength(voltage_kv):
     """Relativistic electron wavelength in angstroms."""
     energy = voltage_kv * 1000 * e
@@ -40,7 +44,7 @@ def read_mdoc(path):
 
 def read_xml(path):
     if path is None:
-        return {}, []
+        return None, []
     root = ET.parse(path).getroot()
     # Remove namespace prefixes once so the field names stay readable.
     for node in root.iter():
@@ -50,6 +54,127 @@ def read_xml(path):
     if info is None or not fractions:
         raise ValueError("XML is not a supported Velox fraction sidecar")
     return info, fractions
+
+
+def detector_geometry(args, mdoc, info, shape, sources, notes):
+    """Resolve stored pixel pitch and the v7 lab-axis fallback, with provenance."""
+
+    def xml(key):
+        return info.findtext(key) if info is not None else None
+
+    camera = " ".join(
+        [
+            mdoc.get(key, "")
+            for key in ("SubFramePath", "CameraName", "Detector", "DetectorModel")
+        ]
+        + [xml(key) or "" for key in ("CommercialName", "CameraName")]
+    ).lower()
+    known_camera = "falcon" in camera or "ceta" in camera
+    pixel = args.pixel_size_mm
+    sources["pixel_size_mm"] = "command line"
+    if pixel is None:
+        binning = None
+        bin_source = None
+        if known_camera:
+            for source, value in (
+                ("MDOC Binning", mdoc.get("Binning")),
+                ("XML Binning", xml("Binning")),
+            ):
+                if value is None:
+                    continue
+                factor = float(value)
+                if not np.isfinite(factor) or factor < 1 or not factor.is_integer():
+                    raise ValueError(f"Invalid {source}; supply --pixel-size-mm X Y")
+                if binning is not None and factor != binning:
+                    raise ValueError(
+                        "MDOC/XML acquisition binning disagrees; supply --pixel-size-mm X Y"
+                    )
+                if binning is None:
+                    binning, bin_source = factor, source
+
+        if "CameraPixelSize" in mdoc:
+            pixel = np.array(
+                [
+                    float(value)
+                    for value in mdoc["CameraPixelSize"].replace(",", " ").split()
+                ]
+            )
+            if pixel.size == 1:
+                pixel = np.repeat(pixel, 2)
+            if pixel.size != 2 or not np.isfinite(pixel).all() or (pixel <= 0).any():
+                raise ValueError(
+                    "MDOC CameraPixelSize must contain one or two positive values in micrometres"
+                )
+            pixel /= 1000
+            sources["pixel_size_mm"] = "MDOC CameraPixelSize (stored-pixel micrometres)"
+            if known_camera and binning is not None:
+                expected = FALCON_CETA_PIXEL_MM * binning
+                if binning > 1 and np.allclose(
+                    pixel, FALCON_CETA_PIXEL_MM, rtol=0.05, atol=0
+                ):
+                    pixel *= binning
+                    sources["pixel_size_mm"] = (
+                        f"MDOC CameraPixelSize (native pitch) * {bin_source}"
+                    )
+                    notes.append(
+                        "CameraPixelSize matches the native Falcon/Ceta pitch; acquisition binning was applied once"
+                    )
+                elif not np.allclose(pixel, expected, rtol=0.05, atol=0):
+                    notes.append(
+                        "CameraPixelSize disagrees with the Falcon/Ceta pitch and binning; using it as stored-pixel pitch. Check --pixel-size-mm"
+                    )
+            else:
+                notes.append(
+                    "Treating CameraPixelSize as stored-pixel micrometres; detector/binning could not confirm it. Check --pixel-size-mm"
+                )
+        elif known_camera:
+            if binning is not None:
+                factors = [binning, binning]
+                sources["pixel_size_mm"] = (
+                    f"Falcon/Ceta 0.014 mm native pitch * {bin_source}"
+                )
+            else:
+                roi = [xml("RegionOfInterest/Width"), xml("RegionOfInterest/Height")]
+                if all(value is not None for value in roi):
+                    height, width = shape[-2:]
+                    factors = np.array(roi, dtype=float) / [width, height]
+                    sources["pixel_size_mm"] = (
+                        "Falcon/Ceta native pitch * XML ROI / MRC dimensions"
+                    )
+                else:
+                    height, width = shape[-2:]
+                    factors = 4096 / np.array([width, height], dtype=float)
+                    sources["pixel_size_mm"] = (
+                        "Falcon/Ceta native pitch * assumed 4096-pixel sensor / MRC dimensions"
+                    )
+                    notes.append(
+                        "No acquisition binning or ROI: assuming a full 4096 x 4096 Falcon/Ceta image. Override --pixel-size-mm for cropped data"
+                    )
+                if (
+                    not np.isfinite(factors).all()
+                    or (factors < 1).any()
+                    or not np.allclose(factors, np.rint(factors))
+                ):
+                    raise ValueError(
+                        "Cannot infer integer Falcon/Ceta acquisition binning; supply --pixel-size-mm X Y"
+                    )
+            pixel = FALCON_CETA_PIXEL_MM * np.asarray(factors)
+        else:
+            raise ValueError(
+                "Cannot determine stored pixel size: no MDOC CameraPixelSize or recognized Falcon/Ceta detector. Supply --pixel-size-mm X Y"
+            )
+
+    axis = args.rotation_axis
+    sources["rotation_axis"] = "command line"
+    if axis is None:
+        axis = LAB_ROTATION_AXIS
+        sources["rotation_axis"] = (
+            "v7 lab calibration fallback (not measured from metadata)"
+        )
+        notes.append(
+            "Rotation axis is not specified; using the v7 lab default (0.999263, -0.0383878, 0). This default may be wrong for your setup. Supply --rotation-axis X Y Z to override"
+        )
+    return np.asarray(pixel, dtype=float), np.asarray(axis, dtype=float)
 
 
 def geometry(args, shape):
@@ -205,8 +330,7 @@ def geometry(args, shape):
         raise ValueError(
             "Distance, wavelength and frame time must be positive; angle step must be nonzero"
         )
-    pixel = np.asarray(args.pixel_size_mm, dtype=float)
-    axis = np.asarray(args.rotation_axis, dtype=float)
+    pixel, axis = detector_geometry(args, mdoc, info, shape, sources, notes)
     if not np.isfinite(pixel).all() or (pixel <= 0).any():
         raise ValueError(
             "--pixel-size-mm must contain two positive stored-MRC pixel sizes"

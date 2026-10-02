@@ -8,11 +8,25 @@ universal beam calibration or improved refined structures.
 ## Findings And Changes
 
 Published v3 used MDOC acquisition binning as additional software binning. The
-replacement requires the physical pitch of the stored MRC pixels and applies
+replacement resolves the physical pitch of the stored MRC pixels and applies
 only the explicitly selected or size-derived additional sum binning. It never
 treats diffraction `PixelSpacing` as a detector pitch. SerialEM distinguishes
 the detector/camera geometry from reciprocal-space pixel spacing in its
 [metadata documentation](https://bio3d.colorado.edu/SerialEM/stableHlp/html/about_formats.htm).
+
+The v9.0.1 compatibility update makes the pitch and axis flags optional. It restores
+v7-style Falcon/Ceta metadata resolution and the lab-axis fallback, with explicit
+warnings and recorded sources. The axis is never described as measured from the
+sidecars. A stated stored-pixel pitch is not multiplied by acquisition binning
+twice; known native-pitch values are distinguished using detector/binning metadata.
+Unresolvable pitch or conflicting binning still produces an actionable error,
+which an explicit calibrated pixel-size override resolves.
+
+This update passed 40 local tests, including a complete CLI conversion with no
+geometry flags and an explicit-geometry comparison. A 12-frame Tyrosine 370 run
+using only MRC/MDOC/XML metadata resolved 0.028 mm input pixels, 0.056 mm output
+pixels and the reported lab-axis fallback. All 12 CBF files were byte-identical
+to the v9 explicit-geometry reference. The historical converters remain unchanged.
 
 The previous CBF writer added 1 to an array-index beam centre, then used that
 same value in XDS. CBF/DIALS and XDS instead differ by half a pixel. For array

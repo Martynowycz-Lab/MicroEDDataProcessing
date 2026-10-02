@@ -22,7 +22,7 @@ from scipy.optimize import least_squares
 
 from metadata import geometry
 
-VERSION = "9.0.0"
+VERSION = "9.0.1"
 INT_MAX = np.iinfo(np.int32).max
 
 
@@ -346,6 +346,17 @@ def convert(args):
         if int(movie.header.ispg) != 0:
             raise ValueError("MRC is marked as a volume, not an image stack")
         meta = geometry(args, data.shape)
+        geometry_note_count = len(meta["notes"])
+        for note in meta["notes"]:
+            print(f"Warning: {note}", flush=True)
+        print(
+            f"Input pixel size (mm): {meta['pixel_size_mm']} [{meta['sources']['pixel_size_mm']}]",
+            flush=True,
+        )
+        print(
+            f"Rotation axis (DIALS): {meta['rotation_axis']} [{meta['sources']['rotation_axis']}]",
+            flush=True,
+        )
         factor = args.bin
         if factor is None:
             minimum_factor = max(1, math.ceil(max(data.shape[1:]) / args.target_size))
@@ -556,7 +567,7 @@ def convert(args):
     print(
         f"Verified {len(written)} CBFs in {report['elapsed_seconds']:.1f} s: {output}"
     )
-    for note in meta["notes"]:
+    for note in meta["notes"][geometry_note_count:]:
         print(f"Note: {note}")
     return report
 
@@ -574,17 +585,15 @@ def parser():
         "--pixel-size-mm",
         type=float,
         nargs=2,
-        required=True,
         metavar=("X", "Y"),
-        help="Physical pixel size in the stored MRC, including acquisition binning",
+        help="Override stored MRC pixel sizes; otherwise use MDOC/known detector metadata",
     )
     result.add_argument(
         "--rotation-axis",
         type=float,
         nargs=3,
-        required=True,
         metavar=("X", "Y", "Z"),
-        help="DIALS laboratory frame: fast +x, slow -y, beam travels -z",
+        help="Override the v7 lab-axis fallback in DIALS coordinates (fast +x, slow -y, beam -z)",
     )
     result.add_argument("--distance-mm", type=float)
     wavelength = result.add_mutually_exclusive_group()
