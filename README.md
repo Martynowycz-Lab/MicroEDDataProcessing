@@ -35,6 +35,17 @@ python mrc2cbf.py frames/*.mrc -o cbf
 python mrc2cbf.py 'frames/*.mrc' -o cbf
 ```
 
+For several Velox stacks with XML but no MDOC, run this from the data folder:
+
+```bash
+python /path/to/MicroEDDataProcessing/mrc2cbf.py '*.mrc' -o cbf --bin 1 --trim none
+```
+
+Each stack gets `cbf/STACK_NAME/image_000001.cbf` and so on. This command keeps
+all frames at their input size. Matching `STACK_NAME.xml` or `STACK_NAME.mrc.xml`
+is read automatically. Unknown geometry is listed at the end; conversion proceeds.
+No voltage, distance, angle, or pixel-size flags are required for pixel conversion.
+
 To keep the input names, use a quoted output pattern:
 
 ```bash

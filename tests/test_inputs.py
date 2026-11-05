@@ -509,6 +509,128 @@ class InputTests(unittest.TestCase):
             self.run_conversion()
         self.assertFalse((self.root / "cbf/conversion.json").exists())
 
+    def velox_stack(self, name, count, period, suffix=".xml", offset=0):
+        from datetime import datetime, timedelta, timezone
+
+        source = self.image(
+            name, np.stack([self.pixels + offset + idx for idx in range(count)])
+        )
+        path = (
+            Path(str(source) + ".xml")
+            if suffix == ".mrc.xml"
+            else source.with_suffix(".xml")
+        )
+        fractions = []
+        for idx in range(count):
+            stamp = datetime(2026, 11, 5, tzinfo=timezone.utc) + timedelta(
+                seconds=idx * period
+            )
+            fractions.append(
+                f"<Fraction><Index>{idx}</Index><StartFrame>{idx * 3}</StartFrame><NumberOfFrames>3</NumberOfFrames><ExposureTime>{period}</ExposureTime><DateTimeWithTimeZone>{stamp.isoformat()}</DateTimeWithTimeZone></Fraction>"
+            )
+        path.write_text(
+            f'<Root xmlns="urn:velox"><Info><CommercialName>Falcon 4</CommercialName><Binning>2</Binning><ExpectedNumberOfFractions>{count}</ExpectedNumberOfFractions><RecordedNumberOfFractions>{count}</RecordedNumberOfFractions><ImageSize><Width>48</Width><Height>32</Height></ImageSize></Info><Fractions>{"".join(fractions)}</Fractions></Root>'
+        )
+        return source, path
+
+    def test_velox_only_stacks_with_quoted_and_shell_globs(self):
+        self.velox_stack("stack1.mrc", 3, 0.1)
+        self.velox_stack("stack2.mrc", 4, 0.2, offset=50)
+        before = {
+            path: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in self.raw.iterdir()
+        }
+        script = str(Path(converter.__file__))
+        commands = [
+            [
+                sys.executable,
+                script,
+                "*.mrc",
+                "-o",
+                "quoted",
+                "--bin",
+                "1",
+                "--trim",
+                "none",
+            ],
+            [
+                "/bin/bash",
+                "-c",
+                'exec "$1" "$2" *.mrc -o expanded --bin 1 --trim none',
+                "mrc2cbf-test",
+                sys.executable,
+                script,
+            ],
+        ]
+        for command in commands:
+            result = subprocess.run(
+                command,
+                cwd=self.raw,
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        for name, count, period, pedestal in (
+            ("stack1", 3, 0.1, 100),
+            ("stack2", 4, 0.2, 50),
+        ):
+            report = json.loads(
+                (self.raw / "quoted" / name / "conversion.json").read_text()
+            )
+            self.assertEqual(report["output_shape"], [count, 32, 48])
+            self.assertEqual(report["storage_pedestal"], pedestal)
+            self.assertAlmostEqual(report["geometry"]["frame_time_s"], period)
+            self.assertEqual(report["geometry"]["pixel_size_mm"], [0.028, 0.028])
+            for key in (
+                "distance_mm",
+                "wavelength_a",
+                "start_angle_deg",
+                "angle_step_deg",
+            ):
+                self.assertIsNone(report["geometry"][key])
+                self.assertIn(key, report["missing_metadata"])
+            self.assertFalse(report["processing_helpers"])
+            self.assertEqual(len(report["sidecars"]), 1)
+            for idx in range(count):
+                cbf = f"image_{idx + 1:06d}.cbf"
+                self.assertEqual(
+                    (self.raw / "quoted" / name / cbf).read_bytes(),
+                    (self.raw / "expanded" / name / cbf).read_bytes(),
+                )
+                with fabio.open(str(self.raw / "quoted" / name / cbf)) as image:
+                    np.testing.assert_array_equal(
+                        image.data - pedestal,
+                        self.pixels + (50 if name == "stack2" else 0) + idx,
+                    )
+        for path, digest in before.items():
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+
+    def test_velox_mrc_xml_name_preserves_dotted_stem(self):
+        source, xml = self.velox_stack("scan.001.mrc", 3, 0.1, suffix=".mrc.xml")
+        # This unrelated XML must not match the shortened 'scan' stem.
+        (self.raw / "scan.xml").write_text("<malformed>")
+        report, _ = self.run_conversion([source])
+        self.assertEqual(set(report["sidecars"]), {str(xml.resolve())})
+        self.assertAlmostEqual(report["geometry"]["frame_time_s"], 0.1)
+
+    def test_generic_velox_xml_does_not_block_two_stacks(self):
+        for name in ("one.mrc", "two.mrc"):
+            source = self.image(name, np.stack([self.pixels] * 2))
+            source.with_suffix(".xml").write_text(
+                "<MicroscopeImage><Metadata/></MicroscopeImage>"
+            )
+        report, printed = self.run_conversion()
+        self.assertEqual(report["status"], "complete")
+        self.assertIn("XML format is not supported", printed)
+        for name in ("one", "two"):
+            result = json.loads(
+                (self.root / "cbf" / name / "conversion.json").read_text()
+            )
+            self.assertEqual(result["output_shape"][0], 2)
+            self.assertIn("distance_mm", result["missing_metadata"])
+
     def test_invalid_explicit_metadata_is_not_treated_as_missing(self):
         self.image("frame1.mrc")
         for flags in (

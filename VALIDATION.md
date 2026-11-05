@@ -6,7 +6,7 @@ with incomplete geometry. It preserves the pixel and pedestal contracts below.
 
 ## New checks
 
-All 73 unittest cases pass locally on macOS, Python 3.11.8. The additional cases
+All 76 unittest cases pass locally on macOS, Python 3.11.8. The additional cases
 cover 2-D and singleton-3-D files, stacks, quoted and expanded globs, literal and
 pattern CBF output, numeric order, gaps, separate sweeps, missing metadata,
 unsupported sidecars, malformed XML, FEI field presence, contradictory metadata,
@@ -15,6 +15,12 @@ counting mode, partial batch failure, output collisions, spaces/Unicode, and a
 drive without hard links. Ruff lint and format checks pass. CI now checks Linux
 and macOS with Python 3.10, 3.12, 3.13, and 3.14. Consult the run for the pushed
 commit for its result.
+
+The Velox-only stack checks use two separate MRC stacks and no MDOC or FEI
+headers. Both quoted globs and actual Bash-expanded globs complete without input
+prompts. Each stack retains all native pixels, its own XML timing, its own
+pedestal, and a separate output folder. Missing geometry stays absent. Tests also
+cover `NAME.mrc.xml`, dotted stems, and unsupported generic Velox XML.
 
 The independent checker now reads both original stacks and individual source
 files. It verifies every output pixel, invalid mask, source frame, scan offset,

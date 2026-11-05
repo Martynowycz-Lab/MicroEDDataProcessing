@@ -338,23 +338,26 @@ def sidecars(args, data):
     """Find a sidecar for this sweep. Do not select an arbitrary XML or MDOC."""
     source = data.paths[0]
     if len(data.paths) == 1:
-        stems = [source, source.with_suffix("")]
+        matches = {
+            "mdoc": [Path(str(source) + ".mdoc"), source.with_suffix(".mdoc")],
+            "xml": [source.with_suffix(".xml"), Path(str(source) + ".xml")],
+        }
     else:
         prefix = numbered_name(source)[0].rstrip("_.-")
         stems = [source.parent / prefix, source.parent / source.parent.name]
+        matches = {
+            name: [Path(str(stem) + suffix) for stem in stems for suffix in suffixes]
+            for name, suffixes in (
+                ("mdoc", (".mdoc", ".mrc.mdoc")),
+                ("xml", (".xml", ".mrc.xml")),
+            )
+        }
     for name in ("mdoc", "xml"):
         selected = getattr(args, name)
         if selected is None:
-            candidates = []
-            for stem in stems:
-                options = (
-                    [Path(str(stem) + ".mdoc"), Path(str(stem) + ".mrc.mdoc")]
-                    if name == "mdoc"
-                    else [stem.with_suffix(".xml")]
-                )
-                for path in options:
-                    if path.is_file() and path not in candidates:
-                        candidates.append(path)
+            candidates = list(
+                dict.fromkeys(path for path in matches[name] if path.is_file())
+            )
             if len(candidates) == 1:
                 selected = candidates[0]
             elif len(candidates) > 1:
