@@ -1,19 +1,12 @@
 # MicroEDDataProcessing
 
-`mrc2cbf.py` (v9.0.1) converts MRC diffraction movies to miniCBF on Linux and macOS.
-It uses `metadata.py` to read one SerialEM movie and optional Velox XML timing.
-The published `mrc2cbf_pipeline_v3.py` is unchanged. Its original instructions
-and the local v7/v8 code are preserved in [legacy](legacy/README.md).
-
-The converter sum-bins pixels, trims weak ends, estimates a static beam centre,
-and adds a reversible storage pedestal. It does not subtract a radial background,
-filter diffraction intensities, estimate gain, or tune offsets to improve
-integration statistics. Every written CBF is decoded and checked against the
-intended integer pixels before the conversion is marked complete.
+`mrc2cbf.py` v9.1 converts MRC images and stacks to miniCBF on Linux and macOS.
+Give it a file, a folder, or a file pattern. It does not ask questions.
+It reads available metadata and lists missing values and assumptions at the end.
 
 ## Install
 
-Python 3.10 or newer:
+Use Python 3.10 or later:
 
 ```bash
 git clone https://github.com/Martynowycz-Lab/MicroEDDataProcessing.git
@@ -23,161 +16,186 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-Keep `mrc2cbf.py` and `metadata.py` together. DIALS and XDS are separate programs;
-neither is needed for conversion. No custom DIALS format plugin is required.
+Keep `mrc2cbf.py`, `metadata.py`, and `inputs.py` together.
+DIALS and XDS are separate programs. Neither is needed for conversion.
 
 ## Convert
 
-Matching `movie.mrc.mdoc` and `movie.xml` sidecars are found automatically:
+A stack, or a folder of individual images:
+
+```bash
+python mrc2cbf.py movie.mrc -o cbf
+python mrc2cbf.py frames/ -o cbf
+```
+
+A shell pattern or a quoted pattern:
+
+```bash
+python mrc2cbf.py frames/*.mrc -o cbf
+python mrc2cbf.py 'frames/*.mrc' -o cbf
+```
+
+To keep the input names, use a quoted output pattern:
+
+```bash
+python mrc2cbf.py 'frames/*.mrc' 'converted/*.cbf'
+python mrc2cbf.py frame.mrc frame.cbf
+```
+
+`frame_001.mrc` becomes `converted/frame_001.cbf`. For a stack, the converter adds
+`_000001`, `_000002`, and so on to its name. The output accepts one `*` in the
+filename. Quote the output pattern so the shell does not expand it.
+A literal CBF output needs one input frame.
+
+The original command still works:
 
 ```bash
 python mrc2cbf.py movie.mrc cbf
 ```
 
-Pixel size is resolved from MDOC `CameraPixelSize` in micrometres or the recognized
-Falcon/Ceta detector and acquisition binning, as in v7. A stored-pixel value such
-as 28 micrometres at binning 2 is used once, not multiplied by binning again.
-A value matching the known 14-micrometre native pitch is multiplied by the stated
-acquisition binning once, with a message. When the pitch is absent, the known
-detector uses MDOC/XML binning, then XML ROI/MRC dimensions. A last-resort 4096-pixel
-full-sensor assumption produces a cropping warning. Unknown detectors can use an
-explicit `CameraPixelSize`, with a warning about the assumed stored-pixel units.
-If no usable pitch can be found, the error asks for `--pixel-size-mm X Y`.
+Without an output argument, files go to a new `cbf` directory in the current
+working directory. Existing outputs are never replaced. Raw files stay read-only.
+Folders are not searched recursively. Supported extensions are `.mrc`, `.mrcs`,
+and `.st`, with either letter case.
 
-When no rotation axis is supplied, the converter uses the **v7 lab default**
-`0.999263 -0.0383878 0` and prints that **it may be wrong for your setup**. This is
-a fallback, not an axis measured from MDOC/XML or the diffraction patterns. Its
-source is recorded in `conversion.json`. Explicit overrides always take precedence:
+Numbered single-image files with the same prefix form one sweep. Numbers set the
+order: `frame2` comes before `frame10`. Different prefixes and separate stacks
+form separate sweeps, each with its own output folder, metadata, and pedestal.
+Repeated input paths are read once. Duplicate frame numbers are an error.
+Gaps in file numbers stay in the recorded angles. Processing helpers are omitted
+for a sweep with gaps. The converter does not join independent crystals.
 
-```bash
-python mrc2cbf.py movie.mrc cbf \
-  --pixel-size-mm 0.028 0.028 --rotation-axis 1 0 0
-```
+## Metadata
 
-Pixel overrides describe **stored MRC pixels**, including acquisition binning.
-The axis uses the DIALS frame: fast +x, slow -y, beam travelling -z. Other
-microscopes should use their calibrated axis. `PixelSpacing` and `RotationRate`
-are still not interpreted as detector pitch or calibrated stage speed. Metadata
-sources and fallback warnings are printed before frame processing.
+Conversion does not require complete geometry. Unknown header fields are omitted.
+The summary and `conversion.json` list them. An incomplete header is sufficient
+for pixel conversion and inspection. It is not sufficient for reliable integration.
 
-MDOC supplies distance, voltage, start angle and `DegreesPerSecond` when available.
-`TiltAngle` is interpreted as the start of input frame 1, not its centre; confirm
-this convention in your acquisition software. XML counts, dimensions, exposure
-durations, timestamps and detector-frame continuity are checked. Inconsistent
-sidecars and nonuniform scans stop conversion. Only a single MDOC FrameSet movie
-is supported; multi-image tilt-series autodocs must not be flattened into it.
-Explicit sidecar paths can be selected with `--mdoc` and `--xml`.
-Exposure agreement uses the larger of 100 microseconds and 0.1% of a frame;
-timestamp jitter about a fitted constant period is bounded by the larger of
-10 microseconds and 0.5% of a frame. Both measured residuals and the timestamp
-tolerance are recorded; this is a tested constant-wedge approximation, not a
-measurement of stage motion during every exposure.
-CBF exposure duration and frame period are recorded separately when XML provides them.
+The converter reads matching SerialEM MDOC, Velox fraction XML, EPU-D acquisition
+XML, and FEI1/FEI2 extended headers. It checks FEI field-presence flags and all
+frames in a series. For a numbered series such as `lam09_0000.mrc`, it looks for
+`lam09.xml` and `lam09.mdoc` or `lam09.mrc.mdoc`. It does not select an arbitrary
+sidecar when several match. Use `--mdoc FILE` or `--xml FILE` to select one.
+An unsupported XML layout is reported and not used. Malformed XML, contradictory
+timing, changed image dimensions, and volumes are errors.
+Only single-FrameSet MDOC files are supported. Other MDOC layouts are reported
+and not used. Per-image tilt series are not flattened into a continuous scan.
 
-Without sidecars, supply the complete geometry:
+Physical pixel pitch comes from MDOC `CameraPixelSize` in micrometres or recognized
+Falcon/Ceta metadata and acquisition binning. Acquisition binning is applied once.
+`PixelSpacing`, MRC voxel size, and FEI sample pixel size are not detector pitch.
+FEI camera length is nominal, not a measured distance calibration. This assumption
+is reported. Gain from acquisition metadata is not applied.
 
-```bash
-python mrc2cbf.py movie.mrc cbf \
-  --pixel-size-mm 0.028 0.028 --rotation-axis 0.999263 -0.0383878 0 \
-  --distance-mm 961.06 --voltage-kv 200 \
-  --start-angle-deg -60 --angle-step-deg 0.169 --frame-time-s 0.08444
-```
+The rotation axis falls back to the previous lab value,
+`0.999263 -0.0383878 0`, with a warning that it can be wrong for another microscope.
+The axis is not measured from the metadata or the images. Supply a calibrated
+axis when available. The frame is DIALS/imgCIF: fast +x, slow -y, incident beam -z.
 
-`--wavelength-a` can replace `--voltage-kv`. The output directory must be new.
-Raw inputs are opened read-only. Failures return a nonzero exit code and leave
-partial output for inspection, without a `conversion.json` completion record.
-Choose a fresh directory to retry. Existing files are never overwritten.
-
-## Pixels And Offset
-
-Additional integer sum-binning targets at most 1024 pixels per axis by default.
-Smaller images are not enlarged. `--bin 1` preserves size; `--bin 2` sums 2 by 2
-blocks. Both dimensions must divide exactly. No detector rows/columns or partial
-time bins are silently dropped; temporal binning is not implemented.
-
-Integer sums are exact. Floating-point input is summed in float64, then rounded
-once to the nearest integer (ties to even); the maximum rounding error is reported.
-`--saturation ADU` marks input values at or above a calibrated limit invalid.
-Otherwise the integer datatype ceiling is used; float input has no inferred
-saturation limit. `--bad-pixels mask.npy` takes a boolean, input-sized mask where
-True means invalid. A bin containing any invalid input is invalid. Invalid pixels
-are stored as -1, not filled or included in the pedestal estimate.
-
-For valid binned values Y, `CBF = round(Y) + pedestal`. The automatic pedestal is
-`max(0, -min(round(Y)))` over retained valid pixels. `--pedestal N` supplies another
-value, but it must preserve every valid pixel. There is no quantile clipping or
-automatic classification of negative tails as detector defects.
-
-**The exact value added is written as XDS OFFSET and DIALS panel pedestal.**
-Both XDS input files use the same number. XDS GAIN remains unset so INIT can
-estimate it. MDOC/XML gain is never applied to either processing program.
-
-For genuine unscaled integer counts, add `--counting`. This validates nonnegative
-integer input and forces both pedestal and OFFSET to zero. Counting acquisition
-alone does not establish the gain of arbitrarily scaled saved images.
-
-## Trimming And Centre
-
-`--trim aggressive` removes only weak leading/trailing illumination. Each retained
-edge requires five consecutive strong frames, using direct-beam peak and summed
-signal relative to their 75th percentiles. These are illumination heuristics, not
-diffraction-quality measurements. Internal weak frames stay in place to preserve
-angles. Use `--trim none` and `--frames FIRST LAST` (inclusive, 1-based) when needed.
-
-Automatic beam finding fits a broad elliptical halo twice with a robust loss,
-excluding the central core. The median of up to 21 fits across the retained sweep
-defines one static centre. At least 80% must succeed; 95th-percentile drift above
-two output pixels stops conversion. This cannot guarantee a correct centre for
-obscured beams or nearby strong reflections. Inspect the report and refine
-geometry downstream. `--beam-radius` adjusts the central search window.
-
-`--beam-center X Y` supplies a calibrated centre in **zero-based input pixel
-centre coordinates**, without an automatic drift check. By default pixel positions
-are unchanged. `--center` applies one integer translation to the whole sweep and
-marks uncovered borders invalid. It can crop edge reflections and does not correct
-a moving beam. There is no subpixel interpolation or per-frame image warping.
-
-## XDS And DIALS
-
-Outputs include `XDS.INP`, `XDS_20230630.INP`, `import_dials.py`, `frames.csv`,
-`conversion.json`, and `image_000001.cbf` onwards. Helpers contain absolute CBF
-paths. Copy the input file/importer to a writable processing directory while
-leaving the CBF files in the read-only data directory:
+Override values with explicit units:
 
 ```bash
-python3 import_dials.py
-python3 import_dials.py --gain 12.5 --output measured_gain.expt
-python3 import_dials.py --source /another/mount/cbf --output other_mount.expt
+python mrc2cbf.py frames/ -o cbf \
+  --pixel-size-mm 0.028 0.028 --distance-mm 1488 \
+  --voltage-kv 200 --rotation-axis 1 0 0 \
+  --start-angle-deg -40 --angle-step-deg 0.25 --frame-time-s 1
 ```
 
-Additional DIALS `name=value` parameters can follow `--`. `--dry-run` prints the
-command. `--pedestal` overrides the DIALS subtraction explicitly; normally keep
-the generated value. Without a gain option, DIALS uses its own default, which
-is **not** a detector-gain measurement.
+These example values are not a calibration for your microscope. Pixel pitch
+refers to the stored MRC pixels. `--wavelength-a` can replace `--voltage-kv`.
+The start angle is the start of the first input frame, not its centre.
+A series-wide start angle cannot locate a subset that begins after file number 1;
+supply `--start-angle-deg` for that subset. Negative sweeps keep file order and
+reverse the axis and angle labels to give an equivalent positive-width scan.
+Explicit scan timing must agree with available timing checks.
 
-An explicit scalar approximation from XDS INIT is available:
+Use `--require-geometry` to return an error if the processing geometry is incomplete.
+No completion record is written for a failed sweep. Use a new output directory
+to retry. In a batch, other sweeps continue and `batch.json` lists failures.
+The command returns a nonzero exit code if any sweep fails.
+
+## Pixels
+
+The default sum bin targets at most 1024 pixels per axis. Smaller images are not
+enlarged. Use `--bin 1` to keep the input size or `--bin 2` to sum 2 by 2 blocks.
+Both dimensions must divide exactly. No partial spatial or time bins are dropped.
+
+Integer sums are exact. Float input is summed in float64 and rounded once to the
+nearest integer, with ties to even. The report gives the maximum rounding error.
+There is no radial subtraction, interpolation, gain correction, or intensity filter.
+
+Bad and saturated pixels invalidate their whole output bin. Invalid pixels are
+stored as -1. They are not filled. Use `--bad-pixels mask.npy` for a boolean input
+mask, where True means invalid. `--saturation ADU` sets a known threshold.
+Without one, the integer datatype limit is used. Float input has no assumed limit.
+
+One storage pedestal preserves all retained valid negative values:
+
+```text
+stored CBF = rounded binned signal + pedestal
+pedestal = max(0, -minimum rounded binned signal)
+```
+
+`--pedestal N` can select another value that preserves every valid pixel.
+The exact added value goes to XDS `OFFSET` and the DIALS panel pedestal.
+XDS `GAIN` stays unset so INIT can estimate it.
+Use `--counting` only for unscaled nonnegative integer counts; it requires zero
+pedestal. Counting acquisition alone does not establish the scale of saved data.
+
+## Trim and beam centre
+
+`--trim auto` is the default. It removes weak ends when illumination can be
+identified. If that check fails, it keeps all selected frames and reports this.
+`--trim aggressive` requires a reliable run of strong frames and fails if absent.
+`--trim none` keeps all selected frames. `--frames FIRST LAST` selects an inclusive,
+1-based range within each sweep. Internal weak frames remain in place.
+These checks measure illumination, not diffraction quality.
+
+Beam finding fits the broad halo in up to 21 frames. It requires 80% of the fits
+to succeed and checks drift against `--max-beam-drift` (default: 2 output pixels).
+If the centre is not reliable, pixels are converted in place and the centre is
+reported as unknown. Fewer than three frames cannot give a reliable drift check.
+Use `--beam-center X Y` for a calibrated centre in zero-based input-pixel coordinates.
+`--beam-radius` sets the search radius in output pixels.
+
+`--center` applies one integer translation to the whole sweep. It requires a
+reliable centre and makes uncovered borders invalid. It can crop edge reflections.
+It does not correct beam drift or interpolate pixels.
+
+## Outputs and processing
+
+Directory output uses `image_000001.cbf` and so on. `frames.csv` maps each CBF to
+its source file, source frame, scan position, and SHA-256 hash. `conversion.json`
+records inputs, metadata sources, missing values, code hashes, and elapsed time.
+Every CBF is decoded and compared with the intended integer pixels before it is
+published. The completion record certifies conversion, not a solved structure.
+
+Complete, consecutive sweeps with standard output names also get `XDS.INP`,
+`XDS_20230630.INP`, and `import_dials.py`. A path with spaces or `!?*` cannot form
+an XDS template, so the processing helpers are omitted and this is reported.
+CBF filename/pattern output writes its report under `mrc2cbf_report/`, or
+`NAME.cbf.report/` for a literal name. It omits the standard-name processing helpers.
+
+Copy the processing input or importer to a writable work directory:
 
 ```bash
-python3 import_dials.py --gain-from-init /path/to/xds/INIT.LP --output xds_gain.expt
+python3 /path/to/cbf/import_dials.py
+python3 /path/to/cbf/import_dials.py --source /another/mount/cbf
+python3 /path/to/cbf/import_dials.py --gain 12.5 --output measured_gain.expt
+python3 /path/to/cbf/import_dials.py --gain-from-init /path/to/xds/INIT.LP
 ```
 
-The helper requires the same CBF path and pedestal in INIT.LP and uses its mean
-gain. This does not reproduce XDS's spatial gain map or variance model. DIALS
-divides corrected pixels by panel gain; do not apply it a second time elsewhere.
-A direct GAIN.cbf transfer is not included: its sampling changed between XDS
-versions, and a guessed resampling is not a validated map conversion.
+`--dry-run` prints the DIALS command. Additional DIALS parameters follow `--`.
+INIT gain transfer requires a matching CBF path and pedestal. It is a scalar
+approximation, not XDS's spatial gain map. Without a gain option, DIALS uses its
+own default. That default is not a measured detector gain.
 
-Run `xds_par` in the writable directory. For XDS 20230630, use `XDS_20230630.INP`
-as `XDS.INP`. Edit the absolute image template if the mount changes. Electron
-templates disable X-ray polarization, air-absorption and silicon-thickness
-corrections. No resolution cutoff or lattice is selected automatically.
+Run `xds_par` with `XDS.INP`. For XDS 20230630, use `XDS_20230630.INP` as `XDS.INP`.
+Templates disable X-ray polarization, air absorption, and silicon corrections.
+No lattice or resolution cutoff is selected. Preserving signed signal does not
+make it Poisson-distributed or fix every XDS noise-model limitation.
 
-Preserving signed signal does not make it Poisson-distributed or guarantee correct
-treatment by every XDS release. Zero high-shell I/sigma with meaningful CC1/2,
-sentinel negative Rmeas, or unsupported high-resolution signal still require
-investigation. The converter does not tune OFFSET to hide these symptoms.
-
-## Validation
+## Check
 
 ```bash
 python -m unittest discover -s tests -v
@@ -185,11 +203,7 @@ python tests/check_pixels.py /path/to/cbf/conversion.json
 dials.python tests/check_dials.py imported.expt /path/to/cbf/conversion.json /path/to/cbf/XDS.INP
 ```
 
-The latter commands independently check raw pixels and stock-DIALS geometry. See
-[VALIDATION.md](VALIDATION.md) for measured results and evidence limits.
-`conversion.json` records a completed file conversion, not a validated structure.
-It includes code hashes, source size/mtime, geometry, trim and pedestal. `frames.csv`
-maps every output to its input frame/start angle and records each CBF's SHA-256.
-
-License: CC-BY-4.0, as declared by the original repository. The historical method
-was described in [the original paper](https://www.biorxiv.org/content/10.1101/2025.07.03.663097v1).
+See [VALIDATION.md](VALIDATION.md) for measured results and limits.
+Historical [v3, v7, and v8](legacy/README.md) remain unchanged.
+License: CC-BY-4.0, as declared by the original repository.
+The original method is described in [the paper](https://www.biorxiv.org/content/10.1101/2025.07.03.663097v1).
