@@ -1,9 +1,11 @@
-"""Read one SerialEM movie and optional Velox fraction timing."""
+"""Read acquisition geometry. Keep absent values separate from invalid values."""
 
+import copy
 from datetime import datetime
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
+import mrcfile
 import numpy as np
 from scipy.constants import c, e, h, m_e
 
@@ -45,7 +47,10 @@ def read_mdoc(path):
 def read_xml(path):
     if path is None:
         return None, []
-    root = ET.parse(path).getroot()
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as error:
+        raise ValueError(f"Malformed XML in {path}: {error}") from error
     # Remove namespace prefixes once so the field names stay readable.
     for node in root.iter():
         node.tag = node.tag.split("}")[-1]
@@ -56,7 +61,88 @@ def read_xml(path):
     return info, fractions
 
 
-def detector_geometry(args, mdoc, info, shape, sources, notes):
+# Field presence flags from the EPU-D MRC2014 specification, Appendix A.
+FEI_FIELDS = {
+    "HT": (1, 5),
+    "Projection mode": (1, 26),
+    "Camera length": (2, 0),
+    "Integration time": (2, 16),
+    "Binning Width": (2, 17),
+    "Binning Height": (2, 18),
+    "Camera name": (2, 19),
+    "Direct detector electron counting": (2, 26),
+    "Start tilt angle": (4, 8),
+    "End tilt angle": (4, 9),
+    "Tilt per image": (4, 10),
+    "Tilt speed": (4, 11),
+}
+
+
+def read_fei(paths):
+    """Read only fields marked present. Do not interpret sample pixel size as pitch."""
+    rows = []
+    for path in paths:
+        with mrcfile.open(path, mode="r", header_only=True) as image:
+            if bytes(image.header.exttyp) not in (b"FEI1", b"FEI2"):
+                rows.extend([{}] * int(image.header.nz))
+                continue
+            extended = image.indexed_extended_header
+            if extended is None or len(extended) != int(image.header.nz):
+                raise ValueError(f"Invalid FEI extended header: {path}")
+            for frame in extended:
+                values = {}
+                for key, (mask, bit) in FEI_FIELDS.items():
+                    if key in extended.dtype.names and int(frame[f"Bitmask {mask}"]) & (
+                        1 << bit
+                    ):
+                        value = frame[key].item()
+                        if isinstance(value, bytes):
+                            value = value.split(b"\0", 1)[0].decode(
+                                "ascii", errors="replace"
+                            )
+                        values[key] = value
+                rows.append(values)
+    result = {}
+    for key in FEI_FIELDS:
+        values = [row.get(key) for row in rows]
+        if not values or any(value is None for value in values):
+            continue
+        if isinstance(values[0], str):
+            uniform = len(set(values)) == 1
+        else:
+            uniform = np.isfinite(values).all() and np.allclose(
+                values, values[0], rtol=1e-6, atol=1e-8
+            )
+        if not uniform:
+            raise ValueError(f"FEI {key} changes within one sweep")
+        result[key] = values[0]
+    return result
+
+
+def read_epu(path):
+    """Read the acquisition XML saved beside an EPU-D image sequence."""
+    if path is None:
+        return {}
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as error:
+        raise ValueError(f"Malformed XML in {path}: {error}") from error
+    for node in root.iter():
+        node.tag = node.tag.split("}")[-1]
+    if root.tag != "AcquisitionDataXml":
+        return {}
+    return {
+        name: float(root.findtext(key))
+        for name, key in (
+            ("start_angle_deg", "StartAngle"),
+            ("angle_step_deg", "TiltPerImage"),
+            ("rotation_rate", "TiltSpeed"),
+        )
+        if root.findtext(key) is not None
+    }
+
+
+def detector_geometry(args, mdoc, info, shape, sources, notes, allow_missing=False):
     """Resolve stored pixel pitch and the v7 lab-axis fallback, with provenance."""
 
     def xml(key):
@@ -159,10 +245,12 @@ def detector_geometry(args, mdoc, info, shape, sources, notes):
                         "Cannot infer integer Falcon/Ceta acquisition binning; supply --pixel-size-mm X Y"
                     )
             pixel = FALCON_CETA_PIXEL_MM * np.asarray(factors)
-        else:
+        elif not allow_missing:
             raise ValueError(
                 "Cannot determine stored pixel size: no MDOC CameraPixelSize or recognized Falcon/Ceta detector. Supply --pixel-size-mm X Y"
             )
+        else:
+            sources["pixel_size_mm"] = "missing"
 
     axis = args.rotation_axis
     sources["rotation_axis"] = "command line"
@@ -174,22 +262,100 @@ def detector_geometry(args, mdoc, info, shape, sources, notes):
         notes.append(
             "Rotation axis is not specified; using the v7 lab default (0.999263, -0.0383878, 0). This default may be wrong for your setup. Supply --rotation-axis X Y Z to override"
         )
-    return np.asarray(pixel, dtype=float), np.asarray(axis, dtype=float)
+    return (np.asarray(pixel, dtype=float) if pixel is not None else None), np.asarray(
+        axis, dtype=float
+    )
 
 
-def geometry(args, shape):
+def geometry(args, shape, allow_missing=False, paths=(), first_number=None):
     """Resolve units and reject contradictory constant-wedge metadata."""
     count, height, width = shape
-    mdoc = read_mdoc(args.mdoc)
-    info, fractions = read_xml(args.xml)
     notes = []
+    try:
+        mdoc = read_mdoc(args.mdoc)
+    except ValueError as error:
+        if not allow_missing or "one FrameSet" not in str(error):
+            raise
+        mdoc = {}
+        notes.append(
+            "MDOC layout is not supported; per-image tilts were not flattened into a continuous scan"
+        )
+    epu = read_epu(args.xml)
+    try:
+        info, fractions = (None, []) if epu else read_xml(args.xml)
+    except ValueError as error:
+        if not allow_missing or "not a supported" not in str(error):
+            raise
+        info, fractions = None, []
+        notes.append("XML format is not supported; its geometry was not used")
+    fei = read_fei(paths) if paths else {}
     sources = {}
+    fallback = {}
+    pixel_hint = None
+    for name, key, scale in (
+        ("distance_mm", "Camera length", 1000),
+        ("voltage_kv", "HT", 0.001),
+        ("start_angle_deg", "Start tilt angle", 1),
+        ("angle_step_deg", "Tilt per image", 1),
+    ):
+        if key in fei:
+            fallback[name] = (fei[key] * scale, f"FEI {key}")
+    if "Tilt speed" in fei:
+        fallback["rotation_rate"] = (fei["Tilt speed"], "FEI Tilt speed")
+    for name, value in epu.items():
+        if name in fallback and not np.isclose(
+            value, fallback[name][0], rtol=1e-3, atol=1e-6
+        ):
+            raise ValueError(f"EPU XML and FEI {name} disagree")
+        fallback[name] = (value, "EPU acquisition XML")
+    if (
+        first_number is not None
+        and first_number > 1
+        and args.start_angle_deg is None
+        and "start_angle_deg" in fallback
+    ):
+        fallback.pop("start_angle_deg", None)
+        notes.append(
+            "Series starts after file number 1; the start angle of the selected files is unknown. Use --start-angle-deg"
+        )
+    if "Camera name" in fei and not any(
+        key in mdoc for key in ("CameraName", "Detector", "SubFramePath")
+    ):
+        mdoc["CameraName"] = fei["Camera name"]
+    if (
+        args.pixel_size_mm is None
+        and "Binning Width" in fei
+        and "Binning Height" in fei
+    ):
+        camera = fei.get("Camera name", "").lower()
+        if "falcon" in camera or "ceta" in camera:
+            factors = np.array(
+                [fei["Binning Width"], fei["Binning Height"]], dtype=float
+            )
+            if (factors < 1).any() or not np.equal(factors, np.rint(factors)).all():
+                raise ValueError(
+                    "FEI acquisition binning must contain positive integers"
+                )
+            if (
+                "Binning" in mdoc
+                and not np.equal(factors, float(mdoc["Binning"])).all()
+            ):
+                raise ValueError(
+                    "MDOC/FEI acquisition binning disagrees; supply --pixel-size-mm X Y"
+                )
+            if "CameraPixelSize" not in mdoc:
+                pixel_hint = FALCON_CETA_PIXEL_MM * factors
+    if args.counting and fei.get("Direct detector electron counting") is False:
+        raise ValueError("--counting contradicts FEI electron counting metadata")
 
     def choose(name, key):
         value = getattr(args, name)
-        sources[name] = "command line" if value is not None else f"MDOC {key}"
+        sources[name] = "command line" if value is not None else "missing"
         if value is None and key in mdoc:
             value = float(mdoc[key])
+            sources[name] = f"MDOC {key}"
+        if value is None and name in fallback:
+            value, sources[name] = fallback[name]
         return value
 
     distance = choose("distance_mm", "CameraLength")
@@ -209,10 +375,18 @@ def geometry(args, shape):
         float(mdoc["ExposureTime"]) / count if "ExposureTime" in mdoc else None
     )
     period = args.frame_time_s if args.frame_time_s is not None else mdoc_period
+    rate = epu.get("rotation_rate", fei.get("Tilt speed"))
+    fei_step = fallback.get("angle_step_deg", (None,))[0]
+    if period is None and rate is not None and rate != 0 and fei_step is not None:
+        period = fei_step / rate
     sources["frame_time_s"] = (
         "command line"
         if args.frame_time_s is not None
         else "MDOC ExposureTime / stack depth"
+        if mdoc_period is not None
+        else "EPU/FEI tilt per image / tilt speed"
+        if period is not None
+        else "missing"
     )
     timing = {"xml_fractions": len(fractions), "mrc_frames": count}
     if fractions:
@@ -302,8 +476,8 @@ def geometry(args, shape):
             "No XML timing check; scan uniformity relies on the supplied MDOC/geometry"
         )
 
-    step = args.angle_step_deg
-    rate = float(mdoc["DegreesPerSecond"]) if "DegreesPerSecond" in mdoc else None
+    step = choose("angle_step_deg", "AngleIncrement")
+    rate = float(mdoc["DegreesPerSecond"]) if "DegreesPerSecond" in mdoc else rate
     derived_step = rate * period if rate is not None and period is not None else None
     if step is not None and derived_step is not None:
         if not np.isclose(step, derived_step, rtol=1e-3, atol=1e-6):
@@ -312,11 +486,9 @@ def geometry(args, shape):
             )
     if step is None:
         step = derived_step
-    sources["angle_step_deg"] = (
-        "command line"
-        if args.angle_step_deg is not None
-        else "MDOC DegreesPerSecond * frame time"
-    )
+        sources["angle_step_deg"] = (
+            "rotation speed * frame time" if step is not None else "missing"
+        )
     for name, value in (
         ("distance-mm", distance),
         ("wavelength-a or voltage-kv", wavelength),
@@ -324,14 +496,35 @@ def geometry(args, shape):
         ("start-angle-deg", start),
         ("angle-step-deg", step),
     ):
-        if value is None or not np.isfinite(value):
-            raise ValueError(f"Supply --{name}; usable metadata are missing")
-    if min(distance, wavelength, period) <= 0 or step == 0:
+        if value is None:
+            if not allow_missing:
+                raise ValueError(f"Supply --{name}; usable metadata are missing")
+        elif not np.isfinite(value):
+            raise ValueError(f"Invalid --{name}; value must be finite")
+    if (
+        any(
+            value is not None and value <= 0 for value in (distance, wavelength, period)
+        )
+        or step == 0
+    ):
         raise ValueError(
             "Distance, wavelength and frame time must be positive; angle step must be nonzero"
         )
-    pixel, axis = detector_geometry(args, mdoc, info, shape, sources, notes)
-    if not np.isfinite(pixel).all() or (pixel <= 0).any():
+    detector_args = copy.copy(args)
+    if pixel_hint is not None:
+        detector_args.pixel_size_mm = pixel_hint
+    pixel, axis = detector_geometry(
+        detector_args, mdoc, info, shape, sources, notes, allow_missing
+    )
+    if pixel_hint is not None:
+        sources["pixel_size_mm"] = (
+            "Falcon/Ceta 0.014 mm native pitch * FEI acquisition binning"
+        )
+    if sources["distance_mm"] == "FEI Camera length":
+        notes.append(
+            "Using the nominal FEI camera length; calibrated distance is unknown. Override --distance-mm if available"
+        )
+    if pixel is not None and (not np.isfinite(pixel).all() or (pixel <= 0).any()):
         raise ValueError(
             "--pixel-size-mm must contain two positive stored-MRC pixel sizes"
         )
@@ -341,18 +534,31 @@ def geometry(args, shape):
         )
     axis /= np.linalg.norm(axis)
     # A positive-width scan about the reversed axis is the same physical rotation.
-    if step < 0:
+    if step is not None and step < 0:
         axis = -axis
-        start = -start
+        start = -start if start is not None else None
         step = -step
         notes.append(
             "Negative scan: axis and start angle negated; frame order preserved"
         )
+    exposure_time = (
+        float(np.mean(exposure)) if fractions else fei.get("Integration time", period)
+    )
+    if exposure_time is not None and (
+        not np.isfinite(exposure_time) or exposure_time <= 0
+    ):
+        raise ValueError("Exposure time must be positive and finite")
+    if (
+        exposure_time is not None
+        and period is not None
+        and exposure_time > period + max(1e-4, period * 1e-3)
+    ):
+        raise ValueError("Exposure time exceeds the frame period")
     return dict(
-        pixel_size_mm=pixel.tolist(),
+        pixel_size_mm=pixel.tolist() if pixel is not None else None,
         distance_mm=distance,
         wavelength_a=wavelength,
-        exposure_time_s=float(np.mean(exposure)) if fractions else period,
+        exposure_time_s=exposure_time,
         frame_time_s=period,
         start_angle_deg=start,
         angle_step_deg=step,

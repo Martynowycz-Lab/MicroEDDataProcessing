@@ -1,3 +1,80 @@
+# v9.1 Input and metadata validation
+
+Checked on 2026-11-05 against v9.0.1 (`89669e1`). Historical source files are
+unchanged. This update adds file/folder/glob input and permits pixel conversion
+with incomplete geometry. It preserves the pixel and pedestal contracts below.
+
+## New checks
+
+All 73 unittest cases pass locally on macOS, Python 3.11.8. The additional cases
+cover 2-D and singleton-3-D files, stacks, quoted and expanded globs, literal and
+pattern CBF output, numeric order, gaps, separate sweeps, missing metadata,
+unsupported sidecars, malformed XML, FEI field presence, contradictory metadata,
+truncated files, volumes, changed dimensions/datatypes, input/sidecar mutation,
+counting mode, partial batch failure, output collisions, spaces/Unicode, and a
+drive without hard links. Ruff lint and format checks pass. CI now checks Linux
+and macOS with Python 3.10, 3.12, 3.13, and 3.14. Consult the run for the pushed
+commit for its result.
+
+The independent checker now reads both original stacks and individual source
+files. It verifies every output pixel, invalid mask, source frame, scan offset,
+angle, and CBF SHA-256. It also supports CBF filename/pattern output. Missing
+angles stay missing; a filename gap does not become a smaller rotation interval.
+
+## Real image-folder check
+
+The NYSBC workshop `proteinase_k/lam09` folder contains 320 individual 2048 by 2048
+float32 MRC images, each with an FEI2 header, plus one EPU-D acquisition XML file.
+With no geometry flags, the update converted all 320 frames at the default sum
+bin of 2 in **13.0–15.2 seconds** across two runs. It kept frames 1–320 and used a storage pedestal of
+1334 ADU. Independent checks passed for every pixel, hash, frame, and angle;
+125,539,737 output pixels retained signed-negative signal after pedestal removal.
+The run opened all raw files read-only and did not move or change them.
+
+The headers supplied 200 kV, 0.028 mm stored pixel pitch, nominal camera length
+1500 mm, 0.25 degrees per frame, and 1 second exposure/period. The beam was
+obscured, so the automatic fit did not establish a centre. Conversion completed
+with that value absent and no processing helpers. The nominal distance and lab
+axis fallback were reported as assumptions. No calibrated distance or axis was
+inferred from this result.
+
+An additional eight-frame run used bin 1 and explicit workshop geometry. Its
+379 ADU pedestal preserved all native pixels, including 10,867,499 signed-negative
+pixels. Stock DIALS 3.19 imported the output using the generated helper. Independent
+checks passed for the detector rays, axis, scan, electron probe, masks, and exact
+pedestal subtraction. A separate asymmetric synthetic fixture also passed with
+unequal pixel pitches, a nonzero axis z component, a negative scan, integer
+translation, and invalid pixels. The installed dxtbx exporter has the known
+rectangular-pixel origin bug; the direct detector-ray check agrees with XDS input.
+
+XDS XYCORR/INIT was attempted with installed 20230630 and November 2025 binaries.
+Their licences had expired, so neither ran INIT. This update therefore has no new
+XDS INIT result. The earlier v9 XDS evidence below remains historical evidence.
+
+## Compatibility and timing
+
+A fixed 64-frame 512 by 512 signed-integer stack produced byte-identical CBFs with
+v9.0.1 and the update, with both one and four workers: 256 CBF files checked.
+One cached local timing comparison, excluding interpreter startup:
+
+| Workers | v9.0.1 | v9.1 |
+| --- | --- | --- |
+| 1 | 0.408 s | 0.458 s |
+| 4 (default) | 0.173 s | 0.172 s |
+
+These short runs are not a general speed guarantee. Workers bound the number of
+live pixel arrays; frames in separate files are opened as needed. The sweep is
+not copied into one large in-memory stack. New outputs are published without
+replacing existing files, and failures do not write a completion record.
+
+FEI fields use the documented presence bits and units in the
+[Thermo Fisher EPU-D manual, Appendix A](https://documents.thermofisher.com/TFS-Assets/MSD/Product-Guides/epu-d-user-manual-1-22.pdf).
+The camera length is nominal. Sample/reciprocal pixel spacing is not used as
+physical detector pitch. Exposure, commanded scan width, and stage speed do not
+prove uniform stage motion during every exposure.
+
+---
+
 # v9 Review And Validation
 
 Reviewed on 2026-10-02 against public repository commit

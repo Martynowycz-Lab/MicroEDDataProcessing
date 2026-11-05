@@ -17,7 +17,8 @@ path = Path(sys.argv[1])
 report = json.loads(path.read_text())
 rows = list(csv.DictReader((path.parent / "frames.csv").open()))
 assert len(rows) == report["output_shape"][0]
-assert len(list(path.parent.glob("image_*.cbf"))) == len(rows)
+if not rows or "output_file" not in rows[0]:
+    assert len(list(path.parent.glob("image_*.cbf"))) == len(rows)
 factor = report["bin"]
 pedestal = report["storage_pedestal"]
 mask = np.load(report["bad_pixels"]) if report.get("bad_pixels") else None
@@ -27,11 +28,15 @@ yy, xx = np.indices((height, width))
 source_y, source_x = yy - dy, xx - dx
 inside = (source_y >= 0) & (source_y < height) & (source_x >= 0) & (source_x < width)
 negative_pixels = 0
-with mrcfile.mmap(report["source"], mode="r") as movie:
-    for idx, row in enumerate(rows):
+for idx, row in enumerate(rows):
+    source = row.get("input_file", report["source"])
+    local_idx = int(row.get("input_file_frame", row["input_frame"])) - 1
+    with mrcfile.mmap(source, mode="r") as movie:
         input_idx = int(row["input_frame"]) - 1
         assert input_idx == report["input_frames"][0] - 1 + idx
-        raw = movie.data[input_idx].astype(np.float64)
+        raw = (movie.data if movie.data.ndim == 2 else movie.data[local_idx]).astype(
+            np.float64
+        )
         invalid = ~np.isfinite(raw)
         if mask is not None:
             invalid |= mask
@@ -53,18 +58,33 @@ with mrcfile.mmap(report["source"], mode="r") as movie:
         stored = np.rint(total).astype(np.int64) + pedestal
         stored[bad] = -1
         expected[inside] = stored[source_y[inside], source_x[inside]]
-        cbf = path.parent / f"image_{idx + 1:06d}.cbf"
+        cbf = (
+            Path(row["output_file"])
+            if row.get("output_file")
+            else path.parent / f"image_{idx + 1:06d}.cbf"
+        )
         assert hashlib.sha256(cbf.read_bytes()).hexdigest() == row["sha256"]
         with fabio.open(str(cbf)) as image:
             np.testing.assert_array_equal(image.data, expected)
         negative_pixels += int(
             np.count_nonzero((expected >= 0) & (expected < pedestal))
         )
-        expected_angle = (
-            report["geometry"]["start_angle_deg"]
-            + idx * report["geometry"]["angle_step_deg"]
+        start, step = (
+            report["geometry"]["start_angle_deg"],
+            report["geometry"]["angle_step_deg"],
         )
-        assert abs(float(row["angle_start_deg"]) - expected_angle) < 1e-9
+        if start is not None and step is not None:
+            offset = (
+                int(row["scan_offset"]) - int(rows[0]["scan_offset"])
+                if "scan_offset" in row
+                else idx
+            )
+            expected_angle = start + offset * step
+            assert abs(float(row["angle_start_deg"]) - expected_angle) < 1e-9
+        elif start is not None and idx == 0:
+            assert abs(float(row["angle_start_deg"]) - start) < 1e-9
+        else:
+            assert row["angle_start_deg"] == ""
 print(
     f"PASS: {len(rows)} frames, all pixels/hashes/indices/angles; {negative_pixels} signed-negative pixels preserved"
 )
