@@ -1,6 +1,7 @@
 """Read acquisition geometry. Keep absent values separate from invalid values."""
 
 import copy
+import re
 from datetime import datetime
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -446,7 +447,14 @@ def geometry(args, shape, allow_missing=False, paths=(), first_number=None):
         stamps = [node.findtext("DateTimeWithTimeZone") for node in fractions]
         if all(stamps) and count > 1:
             timestamps = [
-                datetime.fromisoformat(stamp.replace("Z", "+00:00")) for stamp in stamps
+                datetime.fromisoformat(
+                    re.sub(
+                        r"(?<=\d{2}:\d{2}:\d{2})[.,](\d+)",
+                        lambda match: "." + match[1][:6].ljust(6, "0"),
+                        stamp.replace("Z", "+00:00"),
+                    )
+                )
+                for stamp in stamps
             ]
             times = np.array(
                 [(stamp - timestamps[0]).total_seconds() for stamp in timestamps]
