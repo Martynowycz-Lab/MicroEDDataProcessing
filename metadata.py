@@ -389,6 +389,13 @@ def geometry(args, shape, allow_missing=False, paths=(), first_number=None):
         else "missing"
     )
     timing = {"xml_fractions": len(fractions), "mrc_frames": count}
+    timing_issues = []
+
+    def timing_issue(message):
+        if not allow_missing:
+            raise ValueError(message)
+        timing_issues.append(message)
+
     if fractions:
         if len(fractions) != count:
             raise ValueError("XML fraction count differs from the MRC stack depth")
@@ -420,7 +427,7 @@ def geometry(args, shape, allow_missing=False, paths=(), first_number=None):
         period_source = "XML ExposureTime"
         tolerance = max(1e-4, 1e-3 * xml_period)
         if np.ptp(exposure) > tolerance:
-            raise ValueError(
+            timing_issue(
                 "XML exposures are nonuniform; one constant oscillation width is invalid"
             )
         starts = [int(node.findtext("StartFrame")) for node in fractions]
@@ -429,8 +436,13 @@ def geometry(args, shape, allow_missing=False, paths=(), first_number=None):
             starts[idx + 1] != starts[idx] + lengths[idx] for idx in range(count - 1)
         ):
             raise ValueError("XML detector-frame ranges have gaps or overlaps")
-        if len(set(lengths)) != 1 or min(starts) < 0:
-            raise ValueError("XML detector-frame grouping is not uniform")
+        if min(starts) < 0:
+            raise ValueError("XML detector-frame indices must be nonnegative")
+        if len(set(lengths)) != 1:
+            timing_issue("XML detector-frame grouping is not uniform")
+        timing["frame_exposure_times_s"] = exposure.tolist()
+        timing["detector_start_frames"] = starts
+        timing["detector_frame_counts"] = lengths
         stamps = [node.findtext("DateTimeWithTimeZone") for node in fractions]
         if all(stamps) and count > 1:
             timestamps = [
@@ -453,7 +465,7 @@ def geometry(args, shape, allow_missing=False, paths=(), first_number=None):
                 or np.max(np.abs(residual)) > timestamp_tolerance
                 or abs(measured_period - xml_period) > tolerance
             ):
-                raise ValueError(
+                timing_issue(
                     "XML timestamps do not support contiguous constant-width exposures"
                 )
             xml_period = measured_period
@@ -462,7 +474,11 @@ def geometry(args, shape, allow_missing=False, paths=(), first_number=None):
             notes.append(
                 "XML timestamps unavailable; exposure durations alone cannot exclude acquisition gaps"
             )
-        if period is not None and abs(period - xml_period) > tolerance:
+        if (
+            not timing_issues
+            and period is not None
+            and abs(period - xml_period) > tolerance
+        ):
             raise ValueError(
                 "MDOC/command-line frame time disagrees with XML exposures"
             )
@@ -475,6 +491,17 @@ def geometry(args, shape, allow_missing=False, paths=(), first_number=None):
         notes.append(
             "No XML timing check; scan uniformity relies on the supplied MDOC/geometry"
         )
+
+    if timing_issues:
+        timing["constant_scan_valid"] = False
+        timing["issues"] = timing_issues
+        notes.extend(timing_issues)
+        notes.append(
+            "Pixels and per-frame exposures preserved. Constant scan timing and angles "
+            "are unresolved; XDS/DIALS helpers omitted"
+        )
+        period = None
+        sources["frame_time_s"] = "unresolved XML timing"
 
     step = choose("angle_step_deg", "AngleIncrement")
     rate = float(mdoc["DegreesPerSecond"]) if "DegreesPerSecond" in mdoc else rate
@@ -489,6 +516,10 @@ def geometry(args, shape, allow_missing=False, paths=(), first_number=None):
         sources["angle_step_deg"] = (
             "rotation speed * frame time" if step is not None else "missing"
         )
+    if timing_issues:
+        # Do not apply a constant angular width to an irregular acquisition.
+        step = None
+        sources["angle_step_deg"] = "unresolved XML timing"
     for name, value in (
         ("distance-mm", distance),
         ("wavelength-a or voltage-kv", wavelength),
@@ -544,6 +575,8 @@ def geometry(args, shape, allow_missing=False, paths=(), first_number=None):
     exposure_time = (
         float(np.mean(exposure)) if fractions else fei.get("Integration time", period)
     )
+    if timing_issues:
+        exposure_time = None
     if exposure_time is not None and (
         not np.isfinite(exposure_time) or exposure_time <= 0
     ):

@@ -1,6 +1,6 @@
 # MicroEDDataProcessing
 
-`mrc2cbf.py` v9.1 converts MRC images and stacks to miniCBF on Linux and macOS.
+`mrc2cbf.py` v9.1.1 converts MRC images and stacks to miniCBF on Linux and macOS.
 Give it a file, a folder, or a file pattern. It does not ask questions.
 It reads available metadata and lists missing values and assumptions at the end.
 
@@ -15,6 +15,10 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
+
+If Ubuntu or Debian reports an externally managed Python environment, use the
+virtual environment above. Do not install into system Python. If `venv` is
+missing, install your system's `python3-venv` package, then repeat these steps.
 
 Keep `mrc2cbf.py`, `metadata.py`, and `inputs.py` together.
 DIALS and XDS are separate programs. Neither is needed for conversion.
@@ -87,8 +91,14 @@ XML, and FEI1/FEI2 extended headers. It checks FEI field-presence flags and all
 frames in a series. For a numbered series such as `lam09_0000.mrc`, it looks for
 `lam09.xml` and `lam09.mdoc` or `lam09.mrc.mdoc`. It does not select an arbitrary
 sidecar when several match. Use `--mdoc FILE` or `--xml FILE` to select one.
-An unsupported XML layout is reported and not used. Malformed XML, contradictory
-timing, changed image dimensions, and volumes are errors.
+An unsupported XML layout is reported and not used. Unequal XML exposures,
+unequal detector-frame groups, or irregular timestamps do not block pixel
+conversion. Each CBF keeps its recorded exposure. The converter omits unresolved
+constant frame periods, angle increments, and XDS/DIALS helpers. It lists these
+limits at the end. It does not average an irregular scan into a uniform one.
+`--require-geometry` still rejects incomplete geometry.
+Malformed XML, inconsistent frame counts, detector-frame gaps or overlaps,
+contradictory uniform timing, changed image dimensions, and volumes are errors.
 Only single-FrameSet MDOC files are supported. Other MDOC layouts are reported
 and not used. Per-image tilt series are not flattened into a continuous scan.
 

@@ -28,7 +28,7 @@ from scipy.optimize import least_squares
 from inputs import MRC_SUFFIXES, MrcSeries, find_inputs, group_inputs, numbered_name
 from metadata import geometry
 
-VERSION = "9.1.0"
+VERSION = "9.1.1"
 INT_MAX = np.iinfo(np.int32).max
 
 
@@ -613,8 +613,12 @@ def convert_series(args, data, output):
             )
             image = CbfImage(data=pixels)
             image.header["_array_data.header_convention"] = "GENERIC_MINI"
+            frame_meta = meta
+            exposures = meta["timing"].get("frame_exposure_times_s")
+            if exposures is not None:
+                frame_meta = dict(meta, exposure_time_s=exposures[input_idx])
             image.header["_array_data.header_contents"] = cbf_header(
-                meta, center, angle, pedestal, overload
+                frame_meta, center, angle, pedestal, overload
             )
             # Publish only a verified payload. An existing target cannot be replaced.
             name = (

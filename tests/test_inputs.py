@@ -533,6 +533,59 @@ class InputTests(unittest.TestCase):
         )
         return source, path
 
+    def test_velox_irregular_timing_keeps_pixels_and_actual_exposures(self):
+        import xml.etree.ElementTree as ET
+
+        for case in ("exposure", "grouping", "timestamps"):
+            with self.subTest(case=case):
+                source, xml = self.velox_stack(case + ".mrc", 3, 0.1)
+                root = ET.fromstring(xml.read_text())
+                for node in root.iter():
+                    node.tag = node.tag.rsplit("}", 1)[-1]
+                rows = root.findall("Fractions/Fraction")
+                if case == "exposure":
+                    rows[2].find("ExposureTime").text = "0.05"
+                elif case == "grouping":
+                    rows[2].find("NumberOfFrames").text = "2"
+                else:
+                    rows[2].find(
+                        "DateTimeWithTimeZone"
+                    ).text = "2026-11-05T00:00:00.25+00:00"
+                xml.write_text(ET.tostring(root, encoding="unicode"))
+                report, summary = self.run_conversion([source], output=case)
+                self.assertEqual(report["status"], "complete")
+                self.assertFalse(report["processing_helpers"])
+                self.assertIsNone(report["geometry"]["frame_time_s"])
+                self.assertIsNone(report["geometry"]["angle_step_deg"])
+                self.assertIn("unresolved", summary)
+                for idx, path in enumerate(sorted((self.root / case).glob("*.cbf"))):
+                    with fabio.open(str(path)) as image:
+                        np.testing.assert_array_equal(
+                            image.data - report["storage_pedestal"], self.pixels + idx
+                        )
+                        header = image.header["_array_data.header_contents"]
+                        expected = 0.05 if case == "exposure" and idx == 2 else 0.1
+                        self.assertIn(f"# Exposure_time {expected} s", header)
+                        self.assertNotIn("# Angle_increment", header)
+                        self.assertNotIn("# Exposure_period", header)
+                selected, _ = self.run_conversion(
+                    [source], output=case + "_selected", flags=("--frames", "3", "3")
+                )
+                selected_path = self.root / (case + "_selected") / "image_000001.cbf"
+                with fabio.open(str(selected_path)) as image:
+                    np.testing.assert_array_equal(
+                        image.data - selected["storage_pedestal"], self.pixels + 2
+                    )
+                    expected = 0.05 if case == "exposure" else 0.1
+                    self.assertIn(
+                        f"# Exposure_time {expected} s",
+                        image.header["_array_data.header_contents"],
+                    )
+                with self.assertRaisesRegex(ValueError, "geometry is incomplete"):
+                    self.run_conversion(
+                        [source], output=case + "_strict", flags=("--require-geometry",)
+                    )
+
     def test_velox_only_stacks_with_quoted_and_shell_globs(self):
         self.velox_stack("stack1.mrc", 3, 0.1)
         self.velox_stack("stack2.mrc", 4, 0.2, offset=50)
